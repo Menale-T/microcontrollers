@@ -1,0 +1,121 @@
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLECharacteristic.h>
+#include <BLE2902.h>
+
+// UUIDs for BLE MIDI
+#define MIDI_SERVICE_UUID        "03b80e5a-ede8-4b33-a751-6ce34ec4c700"
+#define MIDI_CHARACTERISTIC_UUID "7772e5db-3868-4112-a1a9-f2669d106bf3"
+
+// Pins for hardware components
+const int buttonPins[8] = {23, 18, 5, 17, 16, 4, 0, 2}; // 8 Buttons
+const int faderPins[8] = {32, 33, 34, 35, 36, 39, 25, 26}; // 8 Faders for channel volume
+const int ccPotPins[8] = {27, 14, 12, 13, 15, 19, 21, 22}; // 8 Pots for CC control
+
+BLEServer* bleServer;
+BLECharacteristic* midiCharacteristic;
+bool deviceConnected = false;
+unsigned long lastPressTime[8] = {0}; // To debounce buttons
+int lastFaderValues[8] = {0}; // Store previous fader values
+int lastCCValues[8] = {0}; // Store previous CC values
+
+// BLE Server Callbacks
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* server) {
+    deviceConnected = true;
+    Serial.println("Device connected");
+  }
+
+  void onDisconnect(BLEServer* server) {
+    deviceConnected = false;
+    Serial.println("Device disconnected, restarting advertising...");
+    BLEDevice::getAdvertising()->start(); // Restart BLE advertising
+  }
+};
+
+// Send MIDI messages
+void sendNoteOn(int note, int velocity, int channel) {
+  uint8_t midiPacket[] = {0x80, 0x90 | (channel & 0x0F), note & 0x7F, velocity & 0x7F};
+  midiCharacteristic->setValue(midiPacket, sizeof(midiPacket));
+  midiCharacteristic->notify();
+}
+
+void sendNoteOff(int note, int velocity, int channel) {
+  uint8_t midiPacket[] = {0x80, 0x80 | (channel & 0x0F), note & 0x7F, velocity & 0x7F};
+  midiCharacteristic->setValue(midiPacket, sizeof(midiPacket));
+  midiCharacteristic->notify();
+}
+
+void sendCCMessage(int ccNumber, int value, int channel) {
+  uint8_t midiPacket[] = {0x80, 0xB0 | (channel & 0x0F), ccNumber & 0x7F, value & 0x7F};
+  midiCharacteristic->setValue(midiPacket, sizeof(midiPacket));
+  midiCharacteristic->notify();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize button and potentiometer pins
+  for (int i = 0; i < 8; i++) {
+    pinMode(buttonPins[i], INPUT_PULLUP);
+    pinMode(faderPins[i], INPUT);
+    pinMode(ccPotPins[i], INPUT);
+  }
+
+  // Initialize BLE
+  BLEDevice::init("ESP32 MIDI Controller");
+  bleServer = BLEDevice::createServer();
+  bleServer->setCallbacks(new ServerCallbacks());
+
+  // Create MIDI BLE service
+  BLEService* midiService = bleServer->createService(MIDI_SERVICE_UUID);
+  midiCharacteristic = midiService->createCharacteristic(
+    MIDI_CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  midiCharacteristic->addDescriptor(new BLE2902());
+  midiService->start();
+
+  // Start BLE advertising
+  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(MIDI_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->start();
+  Serial.println("BLE MIDI started. Waiting for connection...");
+}
+
+void loop() {
+  if (deviceConnected) {
+    // Read fader positions and send CC7 (Channel Volume)
+    for (int i = 0; i < 8; i++) {
+      int faderValue = map(analogRead(faderPins[i]), 0, 4095, 0, 127);
+      if (abs(faderValue - lastFaderValues[i]) > 2) { // Only send if significant change
+        sendCCMessage(7, faderValue, i);
+        lastFaderValues[i] = faderValue;
+      }
+    }
+
+    // Read CC potentiometers and send their values
+    for (int i = 0; i < 8; i++) {
+      int ccValue = map(analogRead(ccPotPins[i]), 0, 4095, 0, 127);
+      if (abs(ccValue - lastCCValues[i]) > 2) {
+        sendCCMessage(1 + i, ccValue, i); // Assign different CC numbers (e.g., modulation, expression)
+        lastCCValues[i] = ccValue;
+      }
+    }
+
+    // Handle button presses (velocity-sensitive notes)
+    for (int i = 0; i < 8; i++) {
+      if (digitalRead(buttonPins[i]) == LOW && millis() - lastPressTime[i] > 200) { // Debounce
+        int velocity = map(analogRead(ccPotPins[i]), 0, 4095, 60, 127); // Velocity from potentiometer
+        sendNoteOn(60 + i, velocity, i);
+        delay(100);
+        sendNoteOff(60 + i, velocity, i);
+        lastPressTime[i] = millis();
+        Serial.print("Played note: ");
+        Serial.print(60 + i);
+        Serial.print(" with velocity: ");
+        Serial.println(velocity);
+      }
+    }
+  }
+}
